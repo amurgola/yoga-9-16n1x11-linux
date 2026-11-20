@@ -1,0 +1,11 @@
+--- a/src/nvidia/generated/g_gpu_nvoc.c
++++ b/src/nvidia/generated/g_gpu_nvoc.c
+@@ -961,7 +961,7 @@
+     else
+     {
+         if (( ((chipHal_HalVarIdx >> 5) == 1UL) && ((1UL << (chipHal_HalVarIdx & 0x1f)) & 0x9c000000UL) ) ||
+-            ( ((chipHal_HalVarIdx >> 5) == 2UL) && ((1UL << (chipHal_HalVarIdx & 0x1f)) & 0x000020c1UL) )) /* ChipHal: GH100 | GB100 | GB102 | GB110 | GB112 | GB20B | GB20C | GR100 */ 
++            ( ((chipHal_HalVarIdx >> 5) == 2UL) && ((1UL << (chipHal_HalVarIdx & 0x1f)) & 0x00002001UL) )) /* ChipHal: GH100 | GB100 | GB102 | GB110 | GB112 | GR100 (GB20B | GB20C dropped: N1x suspends, as it did on 615.78.08) */ 
+         {
+             pThis->__gpuIsPowerManagementUnsupported__ = &gpuIsPowerManagementUnsupported_e661f0;
+         }

@@ -1,0 +1,21 @@
+#!/bin/bash
+# systemd system-sleep hook for n1x_wake_timer: log every sleep cycle to a file
+# that survives a forced power-off, and go back to sleep after a timer wake.
+P=/sys/module/n1x_wake_timer/parameters
+S=/run/n1x-wake-timer.fires
+L=/var/log/n1x-sleep.log
+[ -r $P/fires ] || exit 0
+bat=$(cat /sys/class/power_supply/BAT*/capacity 2>/dev/null | head -1)
+lid=$(awk '{print $2}' /proc/acpi/button/lid/*/state 2>/dev/null | head -1)
+note() { echo "$(date '+%F %T') $* bat=${bat}% lid=${lid}" >> $L; sync $L; }
+case "$1" in
+  pre)  cat $P/fires > $S; note "sleep  period=$(cat $P/period)s" ;;
+  post)
+    if [ "$(cat $P/fires)" != "$(cat $S 2>/dev/null)" ]; then
+      note "wake   timer -> back to sleep"
+      systemd-run --quiet --on-active=6 --timer-property=AccuracySec=1s /usr/bin/systemctl suspend
+    else
+      note "wake   user"
+    fi ;;
+esac
+exit 0

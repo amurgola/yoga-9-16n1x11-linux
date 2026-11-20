@@ -1,0 +1,29 @@
+From: Andrew Murgola <andy@murgo.la>
+Subject: [PATCH] ACPI: OSI: hide Windows 2022 from the Lenovo Yoga 9 2-in-1 16N1X11
+
+The Yoga 9 2-in-1 16N1X11 (83N7, NVIDIA N1x) hides \_SB.SSPM (NVDA8400)
+from an OS that claims Windows 2022, like the Lenovo Pro 9 15N1X11, so
+the keyboard, touchpad, audio, USB4 and EC never power on. Tested with
+acpi_osi="!Windows 2022" on the command line.
+
+---
+ drivers/acpi/osi.c | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+--- a/drivers/acpi/osi.c
++++ b/drivers/acpi/osi.c
+@@ -488,6 +488,14 @@ static const struct dmi_system_id acpi_osi_dmi_table[] __initconst = {
+ 		    DMI_MATCH(DMI_PRODUCT_NAME, "83SS"),
+ 		},
+ 	},
++	{
++	.callback = dmi_disable_osi_win11_22h2,
++	.ident = "Lenovo Yoga 9 2-in-1 16N1X11",
++	.matches = {
++		    DMI_MATCH(DMI_SYS_VENDOR, "LENOVO"),
++		    DMI_MATCH(DMI_PRODUCT_NAME, "83N7"),
++		},
++	},
+ 	/*
+ 	 * ASUS's \MSOS tries "Windows 2022" and then "Windows 2001", so
+ 	 * without the first it reports Windows XP, and the EC event handler

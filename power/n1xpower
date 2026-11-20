@@ -1,0 +1,400 @@
+#!/usr/bin/env python3
+"""n1xpower: power deck CLI for the Lenovo 83N7 (NVIDIA N1X). Runs as the user.
+
+  n1xpower status [--json]
+  n1xpower set refresh 60|120            panel refresh rate (frame cap for vsynced games)
+  n1xpower set cpu-e-max MHZ|0           efficiency-core cap   (needs n1x-powerd; 0 = none)
+  n1xpower set cpu-p-max MHZ|0           performance-core cap  (needs n1x-powerd)
+  n1xpower set gpu-max MHZ|0             GPU clock ceiling     (needs n1x-powerd)
+  n1xpower set soc-limit WATTS|0         firmware SoC power budget (needs n1x-powerd; 0 = default)
+  n1xpower app NAME quota PCT|0          CPU time limit, % of one core (200 = two cores)
+  n1xpower app NAME uclamp PCT           scheduler utilisation clamp, 1..100 (100 = off)
+  n1xpower app NAME ecores on|off        pin to the efficiency cores
+  n1xpower camera [KEY VALUE]            camera clean-up: denoise, chroma, sharpen (0..100),
+                                         contrast, saturation (1.0 = neutral), bin (0/1)
+  n1xpower profile list|save NAME [APP]|apply NAME|delete NAME
+Per-app limits use the app's own systemd cgroup, so they need no root.
+"""
+import glob, json, os, re, socket, subprocess, sys, time
+
+SOCK = "/run/n1x-powerd.sock"
+UID = os.getuid()
+APPS = f"/sys/fs/cgroup/user.slice/user-{UID}.slice/user@{UID}.service/app.slice"
+RUN = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{UID}")
+STATE = os.path.join(RUN, "n1xpower.state")
+CONF = os.path.expanduser("~/.config/n1x-power/profiles.json")
+OUTPUT = "eDP-1"
+
+
+def daemon(req):
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(12)
+        s.connect(SOCK)
+        s.sendall((json.dumps(req) + "\n").encode())
+        return json.loads(s.makefile("r").readline())
+    except Exception as ex:
+        return {"ok": False, "error": f"n1x-powerd not reachable ({ex})"}
+
+
+def rd(path, default=""):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return default
+
+
+def cores():
+    e, p = [], []
+    for d in glob.glob("/sys/devices/system/cpu/cpufreq/policy*"):
+        cpus = [int(c) for c in rd(d + "/affected_cpus").split()]
+        (p if int(rd(d + "/cpuinfo_max_freq", "0")) > 3000000 else e).extend(cpus)
+    return sorted(e), sorted(p)
+
+
+def app_name(cg):
+    n = os.path.basename(cg)
+    n = re.sub(r"\.(service|scope)$", "", n).replace("\\x2d", "-")
+    n = re.sub(r"^app-(flatpak-)?", "", n)
+    n = re.sub(r"(@[0-9a-f]{8,}|@autostart|-\d+)$", "", n)
+    return n
+
+
+def adopt_games():
+    """Steam starts games inside its own cgroup. Move each running game's process tree into a
+    scope of its own (app-game-<name>-<appid>.scope) so it can be limited separately."""
+    launch = {}
+    for d in glob.glob("/proc/[0-9]*"):
+        try:
+            cmd = open(d + "/cmdline", "rb").read()
+        except OSError:
+            continue
+        m = re.search(rb"reaper\0SteamLaunch\0AppId=(\d+)", cmd)
+        if m and "app-steam" in rd(d + "/cgroup"):
+            launch[int(d[6:])] = m.group(1).decode()
+    if not launch:
+        return
+    kids = {}
+    for d in glob.glob("/proc/[0-9]*"):
+        try:
+            st = open(d + "/stat").read()
+            kids.setdefault(int(st.rsplit(")", 1)[1].split()[1]), []).append(int(d[6:]))
+        except (OSError, IndexError, ValueError):
+            pass
+    for root, appid in launch.items():
+        pids, todo = [], [root]
+        while todo:
+            x = todo.pop()
+            pids.append(x)
+            todo += kids.get(x, [])
+        name = appid
+        for lib in glob.glob(os.path.expanduser("~/.local/share/Steam/steamapps/appmanifest_%s.acf" % appid)):
+            m = re.search(r'"name"\s+"([^"]+)"', rd(lib))
+            if m:
+                name = re.sub(r"[^a-z0-9]+", "_", m.group(1).lower()).strip("_")[:32] or appid
+        unit = f"app-game_{name}-{appid}.scope"
+        subprocess.run(["busctl", "--user", "call", "org.freedesktop.systemd1", "/org/freedesktop/systemd1",
+                        "org.freedesktop.systemd1.Manager", "StartTransientUnit", "ssa(sv)a(sa(sv))",
+                        unit, "fail", "2", "PIDs", "au", str(len(pids)), *map(str, pids),
+                        "Slice", "s", "app.slice", "0"], capture_output=True, timeout=5)
+
+
+def app_groups():
+    try:
+        adopt_games()
+    except Exception:
+        pass
+    out = {}
+    for cg in glob.glob(APPS + "/app-*"):
+        if os.path.isfile(cg + "/cgroup.procs") and not cg.endswith(".slice"):
+            out.setdefault(app_name(cg), []).append(cg)
+    return out
+
+
+def app_pids(cgs):
+    pids = []
+    for cg in cgs:
+        for root, _, files in os.walk(cg):
+            if "cgroup.procs" in files:
+                pids += [int(x) for x in rd(root + "/cgroup.procs").split()]
+    return pids
+
+
+def apps_status():
+    now = time.time()
+    try:
+        prev = json.load(open(STATE))
+    except Exception:
+        prev = {}
+    cur, res = {"t": now, "u": {}}, []
+    ecores, _ = cores()
+    for name, cgs in app_groups().items():
+        usage = 0
+        for cg in cgs:
+            m = re.search(r"usage_usec (\d+)", rd(cg + "/cpu.stat"))
+            usage += int(m.group(1)) if m else 0
+        cur["u"][name] = usage
+        dt = now - prev.get("t", 0)
+        pct = 0.0
+        if name in prev.get("u", {}) and 0 < dt < 30:
+            pct = max(0.0, (usage - prev["u"][name]) / 1e4 / dt)
+        cg = cgs[0]
+        q = rd(cg + "/cpu.max", "max 100000").split()
+        quota = 0 if q[0] == "max" else round(int(q[0]) * 100 / int(q[1]))
+        uc = rd(cg + "/cpu.uclamp.max", "max")
+        pids = app_pids(cgs)
+        pinned = False
+        if pids:
+            try:
+                pinned = os.sched_getaffinity(pids[0]) <= set(ecores)
+            except OSError:
+                pass
+        res.append({"name": name, "cpu_pct": round(pct, 1), "quota": quota,
+                    "uclamp": 100 if uc == "max" else round(float(uc)), "ecores": pinned, "procs": len(pids)})
+    try:
+        json.dump(cur, open(STATE, "w"))
+    except OSError:
+        pass
+    res.sort(key=lambda a: -a["cpu_pct"])
+    return res
+
+
+def refresh_rate():
+    try:
+        o = subprocess.run(["kscreen-doctor", "-j"], capture_output=True, text=True, timeout=5).stdout
+        for out in json.loads(o)["outputs"]:
+            if out["name"] == OUTPUT:
+                for m in out["modes"]:
+                    if m["id"] == out["currentModeId"]:
+                        return round(m["refreshRate"])
+    except Exception:
+        pass
+    return 0
+
+
+def fps_status():
+    """Frame rates reported by the n1x_fps Vulkan layer (one small file per presenting process)."""
+    out, now = [], time.time()
+    for f in glob.glob(f"/dev/shm/n1x-fps-{UID}/*") + glob.glob(os.path.expanduser("~/.cache/n1x-fps/*")):
+        try:
+            age = now - os.stat(f).st_mtime
+            if age > 60:
+                os.unlink(f)
+            elif age < 3:
+                v = rd(f).split()
+                out.append({"name": v[2] if len(v) > 2 else "?", "fps": float(v[0]), "ms": float(v[1]), "age": age})
+        except (OSError, ValueError, IndexError):
+            pass
+    out.sort(key=lambda x: x["age"])
+    return [{k: x[k] for k in ("name", "fps", "ms")} for x in out]
+
+
+def status():
+    st = {"daemon": False}
+    d = daemon({"cmd": "status"})
+    if d.get("ok"):
+        st.update(d)
+        st["daemon"] = True
+    else:
+        for key, pat in (("cpu_e_max_mhz", 0), ("cpu_p_max_mhz", 1)):
+            cs = cores()[pat]
+            st[key] = int(rd(f"/sys/devices/system/cpu/cpu{cs[0]}/cpufreq/scaling_max_freq", "0")) // 1000 if cs else 0
+        st["cpu_e_range_mhz"], st["cpu_p_range_mhz"] = [338, 2808], [1378, 4004]
+    try:
+        g = subprocess.run(["nvidia-smi", "--format=csv,noheader,nounits",
+                            "--query-gpu=clocks.gr,power.draw,utilization.gpu,temperature.gpu"],
+                           capture_output=True, text=True, timeout=5).stdout.strip().split(", ")
+        st.update(gpu_mhz=int(float(g[0])), gpu_w=float(g[1]), gpu_util=int(float(g[2])), gpu_temp_c=float(g[3]))
+    except Exception:
+        pass
+    ac = rd("/sys/class/power_supply/ADP0/online") == "1"
+    st["ac"] = ac
+    st["battery_pct"] = int(rd("/sys/class/power_supply/BAT0/capacity", "0"))
+    bw = int(rd("/sys/class/power_supply/BAT0/power_now", "0")) / 1e6
+    st["battery_w"] = round(bw, 1)
+    if not ac and "sys_w" not in st:
+        st["sys_w"] = round(bw, 1)
+    if "soc_w" not in st:  # no root helper: the firmware's PSOC/PSYS "thermal zones" report mW
+        for z in glob.glob("/sys/class/thermal/thermal_zone*"):
+            name = rd(z + "/device/path")[-4:]
+            if name in ("PSOC", "PSYS"):
+                try:
+                    st["soc_w" if name == "PSOC" else "sys_w"] = round((int(rd(z + "/temp")) / 100 + 2732) / 1000, 1)
+                except ValueError:
+                    pass
+    st["refresh"] = refresh_rate()
+    st["fps"] = fps_status()
+    st["camera"] = cam_get()
+    st["apps"] = apps_status()
+    st["profiles"] = sorted(load_profiles())
+    return st
+
+
+def set_refresh(hz):
+    o = subprocess.run(["kscreen-doctor", "-j"], capture_output=True, text=True, timeout=5).stdout
+    for out in json.loads(o)["outputs"]:
+        if out["name"] == OUTPUT:
+            cur = next(m for m in out["modes"] if m["id"] == out["currentModeId"])
+            for m in out["modes"]:
+                if m["size"] == cur["size"] and round(m["refreshRate"]) == int(hz):
+                    subprocess.run(["kscreen-doctor", f"output.{OUTPUT}.mode.{m['id']}"], timeout=10,
+                                   capture_output=True)
+                    return True
+    return False
+
+
+def app_set(name, key, val):
+    groups = app_groups()
+    if name not in groups:
+        sys.exit(f"no running app named {name!r}; have: {', '.join(sorted(groups))}")
+    cgs = groups[name]
+    if key == "quota":
+        v = int(val)
+        for cg in cgs:
+            open(cg + "/cpu.max", "w").write("max 100000" if v <= 0 else f"{max(5, v) * 1000} 100000")
+    elif key == "uclamp":
+        v = int(val)
+        for cg in cgs:
+            open(cg + "/cpu.uclamp.max", "w").write("max" if v >= 100 else str(max(1, v)))
+    elif key == "ecores":
+        e, p = cores()
+        mask = set(e) if val in ("on", "1", "true") else set(e + p)
+        for pid in app_pids(cgs):
+            for task in glob.glob(f"/proc/{pid}/task/*"):
+                try:
+                    os.sched_setaffinity(int(os.path.basename(task)), mask)
+                except OSError:
+                    pass
+    else:
+        sys.exit("app setting must be quota, uclamp or ecores")
+
+
+CAM_CONF = os.path.expanduser("~/.config/n1x-camera.conf")
+CAM_DEFAULTS = {"bin": 1, "denoise": 50, "chroma": 70, "sharpen": 40, "contrast": 1.15, "saturation": 1.0}
+
+
+def cam_get():
+    """Settings of the N1X software-ISP build of libcamera (read live, about twice a second)."""
+    v = dict(CAM_DEFAULTS)
+    for line in rd(CAM_CONF).splitlines():
+        line = line.split("#")[0]
+        if "=" in line:
+            k, val = (x.strip() for x in line.split("=", 1))
+            if k in v:
+                try:
+                    v[k] = float(val) if k in ("contrast", "saturation") else int(float(val))
+                except ValueError:
+                    pass
+    return v
+
+
+def cam_set(key, val):
+    v = cam_get()
+    if key not in v:
+        sys.exit(f"camera setting must be one of: {', '.join(v)}")
+    v[key] = float(val) if key in ("contrast", "saturation") else int(float(val))
+    os.makedirs(os.path.dirname(CAM_CONF), exist_ok=True)
+    tmp = CAM_CONF + ".tmp"
+    with open(tmp, "w") as f:
+        f.write("# Camera clean-up settings (N1X libcamera build). Edited by the Power Deck.\n")
+        f.write("# bin: 1 = combine sensor pixels (full view), 0 = stock centre crop (takes effect at camera start)\n")
+        for k, x in v.items():
+            f.write(f"{k} = {x}\n")
+    os.replace(tmp, CAM_CONF)
+
+
+def load_profiles():
+    try:
+        return json.load(open(CONF))
+    except Exception:
+        return {}
+
+
+def save_profiles(p):
+    os.makedirs(os.path.dirname(CONF), exist_ok=True)
+    json.dump(p, open(CONF, "w"), indent=1)
+
+
+def profile(args):
+    profs = load_profiles()
+    if not args or args[0] == "list":
+        print(json.dumps(profs, indent=1))
+    elif args[0] == "save" and len(args) >= 2:
+        st = status()
+        p = {"refresh": st["refresh"], "cpu_e_max_mhz": st["cpu_e_max_mhz"], "cpu_p_max_mhz": st["cpu_p_max_mhz"],
+             "soc_limit_w": st.get("soc_limit_w", 0)}
+        if len(args) >= 3:
+            a = next((x for x in st["apps"] if x["name"] == args[2]), None)
+            if a:
+                p["app"] = {k: a[k] for k in ("name", "quota", "uclamp", "ecores")}
+        profs[args[1]] = p
+        save_profiles(profs)
+    elif args[0] == "apply" and len(args) >= 2 and args[1] in profs:
+        p = profs[args[1]]
+        if p.get("refresh"):
+            set_refresh(p["refresh"])
+        e, pc = status_ranges()
+        daemon({"cmd": "set", "cpu_e_max_mhz": 0 if p["cpu_e_max_mhz"] >= e else p["cpu_e_max_mhz"],
+                "cpu_p_max_mhz": 0 if p["cpu_p_max_mhz"] >= pc else p["cpu_p_max_mhz"],
+                "soc_limit_w": p.get("soc_limit_w", 0)})
+        a = p.get("app")
+        if a and a["name"] in app_groups():
+            app_set(a["name"], "quota", a["quota"])
+            app_set(a["name"], "uclamp", a["uclamp"])
+            app_set(a["name"], "ecores", "on" if a["ecores"] else "off")
+    elif args[0] == "delete" and len(args) >= 2:
+        profs.pop(args[1], None)
+        save_profiles(profs)
+    else:
+        sys.exit(__doc__)
+
+
+def status_ranges():
+    d = daemon({"cmd": "status"})
+    return d.get("cpu_e_range_mhz", [0, 2808])[1], d.get("cpu_p_range_mhz", [0, 4004])[1]
+
+
+def main():
+    a = sys.argv[1:]
+    if not a or a[0] == "status":
+        st = status()
+        if "--json" in a:
+            print(json.dumps(st))
+        else:
+            for k, v in st.items():
+                if k == "camera":
+                    print(f"{k:18s} " + " ".join(f"{a}={b}" for a, b in v.items()))
+                elif k == "fps":
+                    print(f"{k:18s} " + (", ".join(f"{x['name']} {x['fps']:.0f} fps ({x['ms']:.1f} ms)" for x in v) or "-"))
+                elif k != "apps":
+                    print(f"{k:18s} {v}")
+            for x in st["apps"][:8]:
+                print(f"  {x['name'][:40]:40s} cpu {x['cpu_pct']:6.1f}%  quota {x['quota'] or '-':>4}  "
+                      f"uclamp {x['uclamp']:3d}  ecores {'yes' if x['ecores'] else 'no'}")
+    elif a[0] == "set" and len(a) == 3:
+        if a[1] == "refresh":
+            sys.exit(0 if set_refresh(a[2]) else "no such mode")
+        key = {"cpu-e-max": "cpu_e_max_mhz", "cpu-p-max": "cpu_p_max_mhz", "gpu-max": "gpu_max_mhz",
+               "soc-limit": "soc_limit_w"}.get(a[1])
+        if not key:
+            sys.exit(__doc__)
+        r = daemon({"cmd": "set", key: int(a[2])})
+        if not r.get("ok"):
+            sys.exit(r.get("error", "failed"))
+        if r.get("gpu"):
+            print(r["gpu"])
+    elif a[0] == "app" and len(a) == 4:
+        app_set(a[1], a[2], a[3])
+    elif a[0] == "camera" and len(a) == 3:
+        cam_set(a[1], a[2])
+    elif a[0] == "camera":
+        print(json.dumps(cam_get(), indent=1))
+    elif a[0] == "profile":
+        profile(a[1:])
+    else:
+        sys.exit(__doc__)
+
+
+if __name__ == "__main__":
+    main()

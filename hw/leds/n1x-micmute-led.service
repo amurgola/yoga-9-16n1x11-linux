@@ -1,0 +1,9 @@
+[Unit]
+Description=F4 microphone-mute light follows the default microphone
+After=pipewire-pulse.service
+[Service]
+ExecStart=%h/.local/bin/n1x-micmute-led
+Restart=always
+RestartSec=2
+[Install]
+WantedBy=default.target

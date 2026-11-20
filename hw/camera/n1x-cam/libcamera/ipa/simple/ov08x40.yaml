@@ -1,0 +1,23 @@
+# SPDX-License-Identifier: CC0-1.0
+# Simple-IPA tuning for the Lenovo Yoga 9 16N1X11 front camera (OmniVision OV08X40).
+%YAML 1.1
+---
+version: 1
+algorithms:
+  # OV08X40 black level target (register 0x4003) is 0x40 = 64 at 10 bits, which
+  # matches our dark frames (minimum 43..45 with noise). libcamera's scale is
+  # 16-bit: 64 << 6 = 4096.
+  - BlackLevel:
+      blackLevel: 4096
+  - Awb:
+  # Not a calibration (no chart yet): the Surface port's saturation boost of 1.6
+  # around Rec. 601 luma, rows sum to 1 so grey stays grey.
+  - Ccm:
+      ccms:
+        - ct: 6500
+          ccm: [ 1.4206, -0.3522, -0.0684,
+                 -0.1794,  1.2478, -0.0684,
+                 -0.1794, -0.3522,  1.5316 ]
+  - Adjust:
+  - Agc:
+...

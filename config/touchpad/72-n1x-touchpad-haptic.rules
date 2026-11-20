@@ -1,0 +1,3 @@
+# Lenovo 83N7: set the haptic touchpad's click intensity (default is loud/buzzy).
+# See touchpad-haptic.py.
+ACTION=="add", SUBSYSTEM=="hidraw", KERNELS=="0018:04F3:3355.*", RUN+="/usr/local/bin/touchpad-haptic 30"

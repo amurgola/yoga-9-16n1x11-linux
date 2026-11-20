@@ -1,0 +1,105 @@
+From: Andrew Murgola <andy@murgo.la>
+Date: Fri, 13 Nov 2026 20:30:00 -0500
+Subject: [PATCH] ACPI: processor: take the N1x's firmware-disabled platform _LPI states
+
+The Lenovo Yoga 9 2-in-1 16N1X11 (83N7, NVIDIA N1x) describes its idle
+states as a four-level _LPI hierarchy: CPU (WFI, CoreIdle-OFF), cluster
+(PlatIdle-DSUOFF), package (PlatIdle-PGKSL, PGKLL) and system
+(Standby-DRIPS). Every container level's _LPI clears the Enabled flag of
+its states unless \_SB.PEPD.ELST(1) has set MPEL, which only Windows'
+platform extension driver calls. flatten_lpi_states() skips disabled
+states, so Linux ends up with two states, WFI and core-off, and
+suspend-to-idle never gets below core-off: the DSU, the fabric and DRAM
+stay up and the laptop draws about 5.5 W asleep, 17% of the battery in
+under three hours, and dies overnight with the lid closed.
+
+This differs from the ASUS ProArt P14, where the states come enabled but
+with a minimum residency of 0xFFFFFFFF, which 1023 keys on. On the 83N7
+the residencies are real (DRIPS: 1437 us), so with the states simply
+enabled the idle governors would enter them at runtime, which hangs the
+machine, as Omarchy found when calling ELST(1) at boot.
+
+On systems with the N1x platform extension (NVDA6210), take the
+container states regardless of their Enabled flag and give each an
+infinite minimum residency. The governors never choose them;
+suspend-to-idle, which picks the deepest state by exit latency, does,
+and 1023's wake-latency add still makes DRIPS the deepest. With the
+83N7's tables this yields seven states, state 6 being
+CoreIdle-OFF+PlatIdle-DSUOFF+PlatIdle-PGKLL+Standby-DRIPS, the same
+layout Omarchy verified on the P14.
+
+Signed-off-by: Andrew Murgola <andy@murgo.la>
+---
+--- a/drivers/acpi/acpi_processor.c
++++ b/drivers/acpi/acpi_processor.c
+@@ -1213,7 +1213,8 @@
+ 				       struct acpi_lpi_state *lpi_states,
+ 				       unsigned int state_count,
+ 				       struct acpi_lpi_states_array *curr,
+-				       struct acpi_lpi_states_array *prev)
++				       struct acpi_lpi_states_array *prev,
++				       bool n1x)
+ {
+ 	struct acpi_lpi_state *parent_lpi = curr->entries;
+ 	unsigned int j;
+@@ -1227,12 +1228,34 @@
+ 		struct acpi_lpi_state *flpi;
+ 		int i;
+ 
+-		if (!(parent_lpi->flags & ACPI_LPI_STATE_FLAGS_ENABLED))
+-			continue;
++		if (!(parent_lpi->flags & ACPI_LPI_STATE_FLAGS_ENABLED)) {
++			if (!n1x)
++				continue;
++			/*
++			 * The NVIDIA N1x firmware (Lenovo Yoga 9 2-in-1 16N1X11,
++			 * 83N7) clears the Enabled flag of every processor
++			 * container state (DSU off, package, Standby-DRIPS)
++			 * unless \_SB.PEPD.ELST(1) has set MPEL, which only
++			 * Windows' platform extension calls. Take the states
++			 * anyway, so suspend-to-idle can reach DRIPS.
++			 */
++			pr_info_once("ACPI: N1x: taking the firmware-disabled platform _LPI states for suspend-to-idle\n");
++		}
+ 
+ 		if (too_many_states(handle, state_count))
+ 			break;
+ 
++		/*
++		 * On the N1x the platform states carry their real residencies
++		 * once enabled, and Linux's idle governors then enter them with
++		 * devices running, which hangs the machine (see the DRIPS note
++		 * in processor_idle.c). Give every container state an infinite
++		 * residency: the governors never pick it, suspend-to-idle, which
++		 * goes by exit latency, still does.
++		 */
++		if (n1x)
++			parent_lpi->min_residency = U32_MAX;
++
+ 		flpi = &lpi_states[state_count];
+ 
+ 		for (i = 0; i < prev->composite_states_size; i++) {
+@@ -1264,11 +1287,14 @@
+ 	acpi_handle handle = pr_handle;
+ 	unsigned int state_count = 0;
+ 	unsigned int i;
++	bool n1x;
+ 	int ret;
+ 
+ 	if (!osc_pc_lpi_support_confirmed)
+ 		return -EOPNOTSUPP;
+ 
++	n1x = acpi_dev_present("NVDA6210", NULL, -1);
++
+ 	curr = &info[0];
+ 	curr->composite_states_size = 0;
+ 
+@@ -1331,7 +1357,7 @@
+ 
+ 		/* flatten all the LPI states in this level of hierarchy */
+ 		state_count = flatten_lpi_states(pr_handle, pr_power->lpi_states,
+-						 state_count, curr, prev);
++						 state_count, curr, prev, n1x);
+ 
+ 		kfree(curr->entries);
+ 

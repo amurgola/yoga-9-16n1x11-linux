@@ -1,0 +1,19 @@
+#%PAM-1.0
+# /etc/pam.d/kde-fingerprint
+# KDE lock screen, background ("non-interactive") authentication: face recognition with Howdy.
+# The lock screen runs this stack by itself whenever its interface is visible (key press,
+# pointer movement) and retries it, alongside the normal password field.
+# Overrides /usr/lib/pam.d/kde-fingerprint (fprintd; this laptop has no fingerprint reader).
+auth       required                    pam_shells.so
+auth       requisite                   pam_nologin.so
+# success -> skip the deny line; anything else (no match, lid closed, camera busy) -> plain failure
+auth       [success=1 default=ignore]  pam_howdy.so
+auth       requisite                   pam_deny.so
+auth       required                    pam_permit.so
+auth       required                    pam_env.so
+
+account    include                     system-local-login
+
+password   required                    pam_deny.so
+
+session    include                     system-local-login

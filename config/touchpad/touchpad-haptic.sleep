@@ -1,0 +1,4 @@
+#!/bin/sh
+# systemd-sleep hook: the touchpad may lose its haptic intensity over suspend.
+[ "$1" = post ] && /usr/local/bin/touchpad-haptic 30 >/dev/null 2>&1
+exit 0

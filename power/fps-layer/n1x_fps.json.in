@@ -1,0 +1,13 @@
+{
+  "file_format_version": "1.0.0",
+  "layer": {
+    "name": "VK_LAYER_N1X_fps",
+    "type": "GLOBAL",
+    "library_path": "@LIB@",
+    "api_version": "1.4.0",
+    "implementation_version": "1",
+    "description": "N1X Power Deck frame counter",
+    "functions": { "vkNegotiateLoaderLayerInterfaceVersion": "vkNegotiateLoaderLayerInterfaceVersion" },
+    "disable_environment": { "DISABLE_N1X_FPS": "1" }
+  }
+}

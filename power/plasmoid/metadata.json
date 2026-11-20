@@ -1,0 +1,13 @@
+{
+    "KPackageStructure": "Plasma/Applet",
+    "KPlugin": {
+        "Id": "org.n1x.powerdeck",
+        "Name": "Power Deck",
+        "Description": "Live power readouts and per-app power profiles for the NVIDIA N1X",
+        "Icon": "battery-profile-performance",
+        "Category": "System Information",
+        "Version": "0.1",
+        "License": "GPL-2.0+"
+    },
+    "X-Plasma-API-Minimum-Version": "6.0"
+}

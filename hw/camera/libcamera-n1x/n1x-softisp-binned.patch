@@ -1,0 +1,585 @@
+diff --git a/src/libcamera/software_isp/debayer_cpu.cpp b/src/libcamera/software_isp/debayer_cpu.cpp
+index 49382b4..34b3121 100644
+--- a/src/libcamera/software_isp/debayer_cpu.cpp
++++ b/src/libcamera/software_isp/debayer_cpu.cpp
+@@ -12,6 +12,7 @@
+ #include "debayer_cpu.h"
+ 
+ #include <algorithm>
++#include <cmath>
+ #include <stdlib.h>
+ #include <sys/ioctl.h>
+ #include <utility>
+@@ -20,6 +21,9 @@
+ 
+ #include <libcamera/base/thread.h>
+ 
++#include <fstream>
++#include <sys/stat.h>
++
+ #include <libcamera/formats.h>
+ 
+ #include "libcamera/internal/bayer_format.h"
+@@ -50,6 +54,14 @@ private:
+ 	void memcpyNextLine(const uint8_t *linePointers[]);
+ 	void process2(uint32_t frame, const uint8_t *src, uint8_t *dst);
+ 	void process4(uint32_t frame, const uint8_t *src, uint8_t *dst);
++	void processBinned(uint32_t frame, const uint8_t *src, uint8_t *dst);
++	void binAccumulate(uint32_t frame, const uint8_t *src, int oy, bool stats, int32_t *rgb[3]);
++	std::vector<uint8_t> binLines_[2];
++	std::vector<uint32_t> binAcc_[3];
++	std::vector<int32_t> binAcc_r_, binAcc_g_, binAcc_b_;	/* matrix output, gamma table indices */
++	std::vector<int32_t> binRows_[3][3];	/* [ring slot][channel] linear rows after gains */
++	std::vector<int32_t> binSum_[3][3];	/* [ring slot][Y, Cr, Cb] horizontal 3-sums */
++	std::vector<int32_t> binYcc_[3][3];	/* [ring slot][Y, Cr, Cb] */
+ 
+ 	/* Max. supported Bayer pattern height is 4, debayering this requires 5 lines */
+ 	static constexpr unsigned int kMaxLineBuffers = 5;
+@@ -696,12 +708,54 @@ int DebayerCpu::configure(const StreamConfiguration &inputCfg,
+ 	 */
+ 	params_.gamma = 1.0;
+ 
+-	window_.x = ((inputCfg.size.width - outputCfg.size.width) / 2) &
++	/*
++	 * N1X: bin instead of cropping when the output is at most half the input.
++	 */
++	bin_ = 1;
++	binOutSize_ = outputCfg.size;
++	loadBinTuning();
++	{
++		BayerFormat bayer = BayerFormat::fromPixelFormat(inputCfg.pixelFormat);
++		unsigned int k = std::min(inputCfg.size.width / outputCfg.size.width,
++					  inputCfg.size.height / outputCfg.size.height);
++		if (binTuning_.enable && k >= 2 &&
++		    bayer.packing == BayerFormat::Packing::None &&
++		    (bayer.bitDepth == 8 || bayer.bitDepth == 10 || bayer.bitDepth == 12) &&
++		    isStandardBayerOrder(bayer.order)) {
++			/* colour at [y & 1][x & 1]: 0 R, 1 G, 2 B; two bits each */
++			static const unsigned int orders[4][4] = {
++				{ 2, 1, 1, 0 }, /* BGGR */
++				{ 1, 2, 0, 1 }, /* GBRG */
++				{ 1, 0, 2, 1 }, /* GRBG */
++				{ 0, 1, 1, 2 }, /* RGGB */
++			};
++			unsigned int o;
++			switch (bayer.order) {
++			case BayerFormat::BGGR: o = 0; break;
++			case BayerFormat::GBRG: o = 1; break;
++			case BayerFormat::GRBG: o = 2; break;
++			default: o = 3; break;
++			}
++			binOrder_ = orders[o][0] | (orders[o][1] << 2) |
++				    (orders[o][2] << 4) | (orders[o][3] << 6);
++			bin_ = std::min(k, 8u);
++			binBits_ = bayer.bitDepth;
++			DebayerOutputConfig outCfg;
++			if (getOutputConfig(outputCfg.pixelFormat, outCfg) != 0)
++				return -EINVAL;
++			binOutBpp_ = outCfg.bpp / 8;
++			LOG(Debayer, Info)
++				<< "N1X binned path: " << inputCfg.size << " -> "
++				<< outputCfg.size << " (" << bin_ << "x" << bin_ << " binning)";
++		}
++	}
++
++	window_.width = outputCfg.size.width * bin_;
++	window_.height = outputCfg.size.height * bin_;
++	window_.x = ((inputCfg.size.width - window_.width) / 2) &
+ 		    ~(inputConfig_.patternSize.width - 1);
+-	window_.y = ((inputCfg.size.height - outputCfg.size.height) / 2) &
++	window_.y = ((inputCfg.size.height - window_.height) / 2) &
+ 		    ~(inputConfig_.patternSize.height - 1);
+-	window_.width = outputCfg.size.width;
+-	window_.height = outputCfg.size.height;
+ 
+ 	/*
+ 	 * Set the stats window to the whole processed window. Its coordinates are
+@@ -710,8 +764,10 @@ int DebayerCpu::configure(const StreamConfiguration &inputCfg,
+ 	 */
+ 	stats_->setWindow(Rectangle(window_.size()));
+ 
++	/* In the binned path the threads split the OUTPUT rows */
++	unsigned int rows = bin_ > 1 ? outputCfg.size.height : window_.height;
+ 	unsigned int yStart = 0;
+-	unsigned int linesPerThread = (window_.height / threads_.size()) &
++	unsigned int linesPerThread = (rows / threads_.size()) &
+ 				      ~(inputConfig_.patternSize.height - 1);
+ 	unsigned int i;
+ 
+@@ -719,7 +775,7 @@ int DebayerCpu::configure(const StreamConfiguration &inputCfg,
+ 		threads_[i]->configure(yStart, yStart + linesPerThread);
+ 		yStart += linesPerThread;
+ 	}
+-	threads_[i]->configure(yStart, window_.height);
++	threads_[i]->configure(yStart, rows);
+ 
+ 	return 0;
+ }
+@@ -841,16 +897,20 @@ void DebayerCpuThread::process(uint32_t frame, const uint8_t *src, uint8_t *dst)
+ {
+ 	Rectangle &window = debayer_->window_;
+ 
+-	/* Adjust src to top left corner of the window */
+-	src += (window.y + yStart_) * debayer_->inputConfig_.stride +
+-	       window.x * debayer_->inputConfig_.bpp / 8;
+-	/* Adjust dst for yStart_ */
+-	dst += yStart_ * debayer_->outputConfig_.stride;
+-
+-	if (debayer_->inputConfig_.patternSize.height == 2)
+-		process2(frame, src, dst);
+-	else
+-		process4(frame, src, dst);
++	if (debayer_->bin_ > 1) {
++		processBinned(frame, src, dst);
++	} else {
++		/* Adjust src to top left corner of the window */
++		src += (window.y + yStart_) * debayer_->inputConfig_.stride +
++		       window.x * debayer_->inputConfig_.bpp / 8;
++		/* Adjust dst for yStart_ */
++		dst += yStart_ * debayer_->outputConfig_.stride;
++
++		if (debayer_->inputConfig_.patternSize.height == 2)
++			process2(frame, src, dst);
++		else
++			process4(frame, src, dst);
++	}
+ 
+ 	debayer_->workPendingMutex_.lock();
+ 	debayer_->workPending_ &= ~(1 << threadIndex_);
+@@ -924,6 +984,369 @@ void DebayerCpuThread::process2(uint32_t frame, const uint8_t *src, uint8_t *dst
+ 	}
+ }
+ 
++
++/* ------------------------------------------------------------------------
++ * N1X binned path
++ */
++
++/**
++ * \brief Read ~/.config/n1x-camera.conf (key = value lines) when it changed
++ *
++ * Keys: bin (0/1), denoise, chroma, sharpen (0..100), contrast, saturation
++ * (floats, 1.0 = neutral). The path can be overridden with N1X_CAMERA_CONF.
++ */
++void DebayerCpu::loadBinTuning()
++{
++	if (binTuningPath_.empty()) {
++		const char *env = ::getenv("N1X_CAMERA_CONF");
++		const char *home = ::getenv("HOME");
++		if (env)
++			binTuningPath_ = env;
++		else if (home)
++			binTuningPath_ = std::string(home) + "/.config/n1x-camera.conf";
++		else
++			binTuningPath_ = "/etc/n1x-camera.conf";
++	}
++
++	struct stat st;
++	int64_t mtime = 0;
++	if (::stat(binTuningPath_.c_str(), &st) == 0)
++		mtime = static_cast<int64_t>(st.st_mtim.tv_sec) * 1000000000LL + st.st_mtim.tv_nsec;
++	if (mtime == binTuningMtime_)
++		return;
++	binTuningMtime_ = mtime;
++
++	BinTuning t;
++	std::ifstream file(binTuningPath_);
++	std::string line;
++	while (file && std::getline(file, line)) {
++		size_t hash = line.find('#');
++		if (hash != std::string::npos)
++			line.erase(hash);
++		size_t eq = line.find('=');
++		if (eq == std::string::npos)
++			continue;
++		auto trim = [](std::string v) {
++			size_t b = v.find_first_not_of(" \t\r");
++			size_t e = v.find_last_not_of(" \t\r");
++			return b == std::string::npos ? std::string() : v.substr(b, e - b + 1);
++		};
++		std::string key = trim(line.substr(0, eq));
++		std::string val = trim(line.substr(eq + 1));
++		char *end = nullptr;
++		double num = std::strtod(val.c_str(), &end);
++		if (end == val.c_str())
++			continue;
++		if (key == "bin")
++			t.enable = num != 0;
++		else if (key == "denoise")
++			t.denoise = std::clamp(static_cast<int>(num), 0, 100);
++		else if (key == "chroma")
++			t.chroma = std::clamp(static_cast<int>(num), 0, 100);
++		else if (key == "sharpen")
++			t.sharpen = std::clamp(static_cast<int>(num), 0, 100);
++		else if (key == "contrast")
++			t.contrast = std::clamp(static_cast<float>(num), 0.5f, 2.5f);
++		else if (key == "saturation")
++			t.saturation = std::clamp(static_cast<float>(num), 0.0f, 2.5f);
++	}
++	binTuning_ = t;
++	/* force the tables to be rebuilt */
++	binBlack_[0] = -1;
++	LOG(Debayer, Info)
++		<< "N1X tuning: bin=" << t.enable << " denoise=" << t.denoise
++		<< " chroma=" << t.chroma << " sharpen=" << t.sharpen
++		<< " contrast=" << t.contrast << " saturation=" << t.saturation;
++}
++
++void DebayerCpu::updateBinTables(const DebayerParams &params)
++{
++	const bool changed =
++		binBlack_[0] < 0 ||
++		params.gamma != params_.gamma ||
++		params.contrastExp != params_.contrastExp ||
++		params.blackLevel != params_.blackLevel ||
++		params.gains != params_.gains ||
++		!std::equal(params.combinedMatrix.data().begin(), params.combinedMatrix.data().end(),
++			    params_.combinedMatrix.data().begin());
++	if (!changed)
++		return;
++
++	const float contrastExp = params.contrastExp * binTuning_.contrast;
++	const float divisor = kBinGammaSize - 1.0;
++	for (unsigned int i = 0; i < kBinGammaSize; i++) {
++		float normalized = i / divisor;
++		if (normalized < 0.5)
++			normalized = 0.5 * std::pow(normalized / 0.5, contrastExp);
++		else
++			normalized = 1.0 - 0.5 * std::pow((1.0 - normalized) / 0.5, contrastExp);
++		binGamma_[i] = static_cast<uint8_t>(
++			std::clamp(UINT8_MAX * std::pow(normalized, params.gamma) + 0.5, 0.0, 255.0));
++	}
++
++	/* extra saturation around Rec. 601 luma, applied after the colour matrix */
++	const float sat = binTuning_.saturation;
++	const float luma[3] = { 0.299f, 0.587f, 0.114f };
++	for (unsigned int r = 0; r < 3; r++) {
++		for (unsigned int c = 0; c < 3; c++) {
++			float v = 0;
++			for (unsigned int k = 0; k < 3; k++) {
++				float satm = luma[k] * (1.0f - sat) + (r == k ? sat : 0.0f);
++				v += satm * params.combinedMatrix[k][c];
++			}
++			binMatrix_[r][c] = static_cast<int32_t>(std::lround(std::clamp(v, -8.0f, 8.0f) * 1024.0f));
++		}
++	}
++
++	const float black[3] = { params.blackLevel.r(), params.blackLevel.g(), params.blackLevel.b() };
++	const float gains[3] = { params.gains.r(), params.gains.g(), params.gains.b() };
++	for (unsigned int c = 0; c < 3; c++) {
++		binBlack_[c] = static_cast<int32_t>(std::clamp(black[c], 0.0f, 0.9f) * 65535.0f);
++		/* stretch what is left above black back to full scale, as the stock path does */
++		float stretch = 65535.0f / std::max(1.0f, 65535.0f - binBlack_[c]);
++		binGain_[c] = static_cast<int32_t>(std::clamp(gains[c] * stretch, 0.0f, 64.0f) * 1024.0f);
++	}
++}
++
++/*
++ * Linear RGB for output row oy: per-colour average of the bin x bin raw block,
++ * black level removed and white-balance gains applied, 16-bit scale.
++ */
++void DebayerCpuThread::binAccumulate(uint32_t frame, const uint8_t *src, int oy, bool stats, int32_t *rgb[3])
++{
++	const unsigned int k = debayer_->bin_;
++	const Rectangle &window = debayer_->window_;
++	const unsigned int stride = debayer_->inputConfig_.stride;
++	const unsigned int bytesPP = debayer_->inputConfig_.bpp / 8;
++	const unsigned int outW = debayer_->binOutSize_.width;
++	const unsigned int order = debayer_->binOrder_;
++	const bool wide = bytesPP == 2;
++
++	for (unsigned int c = 0; c < 3; c++)
++		std::fill(binAcc_[c].begin(), binAcc_[c].end(), 0);
++
++	const uint8_t *winSrc = src + window.y * stride + window.x * bytesPP;
++	int cachedNext = -1;
++
++	for (unsigned int r = 0; r < k; r++) {
++		const unsigned int yy = oy * k + r; /* raw line inside the window */
++		const uint8_t *line = winSrc + yy * stride;
++		const uint8_t *lp[3];
++
++		/*
++		 * The camera buffers are uncached memory: element-wise reads from
++		 * them are very slow (measured: 3.75 fps), a bulk copy is not. So
++		 * copy each raw line once into a line buffer and work from there.
++		 */
++		const size_t lineBytes = static_cast<size_t>(window.width) * bytesPP;
++		if (enableInputMemcpy_) {
++			if (cachedNext == static_cast<int>(yy))
++				std::swap(binLines_[0], binLines_[1]);
++			else
++				memcpy(binLines_[0].data(), line, lineBytes);
++			lp[1] = binLines_[0].data();
++		} else {
++			lp[1] = line;
++		}
++		if (stats && !(yy & 1) && yy + 1 < window.height) {
++			if (enableInputMemcpy_) {
++				memcpy(binLines_[1].data(), line + stride, lineBytes);
++				cachedNext = yy + 1;
++				lp[2] = binLines_[1].data();
++			} else {
++				lp[2] = line + stride;
++			}
++			lp[0] = lp[2];
++			debayer_->stats_->processLine0(frame, yy, lp, threadIndex_);
++		}
++
++		uint32_t *a0 = binAcc_[(order >> ((yy & 1) * 4)) & 3].data();
++		uint32_t *a1 = binAcc_[(order >> ((yy & 1) * 4 + 2)) & 3].data();
++
++		if (wide) {
++			const uint16_t *p = reinterpret_cast<const uint16_t *>(lp[1]);
++			if (k == 2) {
++				for (unsigned int ox = 0; ox < outW; ox++) {
++					a0[ox] += p[2 * ox];
++					a1[ox] += p[2 * ox + 1];
++				}
++			} else {
++				unsigned int x = 0;
++				for (unsigned int ox = 0; ox < outW; ox++)
++					for (unsigned int j = 0; j < k; j++, x++)
++						((x & 1) ? a1 : a0)[ox] += p[x];
++			}
++		} else {
++			const uint8_t *p = lp[1];
++			unsigned int x = 0;
++			for (unsigned int ox = 0; ox < outW; ox++)
++				for (unsigned int j = 0; j < k; j++, x++)
++					((x & 1) ? a1 : a0)[ox] += p[x];
++		}
++	}
++
++	/* samples of each colour in a block depend on the block's parity when k is odd */
++	const unsigned int maxval = (1u << debayer_->binBits_) - 1;
++	uint64_t mul[2][3];
++	for (unsigned int px = 0; px < 2; px++) {
++		unsigned int cnt[3] = { 0, 0, 0 };
++		for (unsigned int r = 0; r < k; r++)
++			for (unsigned int j = 0; j < k; j++) {
++				unsigned int yy = oy * k + r, xx = px * k + j;
++				cnt[(order >> ((yy & 1) * 4 + (xx & 1) * 2)) & 3]++;
++			}
++		for (unsigned int c = 0; c < 3; c++)
++			mul[px][c] = (65535ull << 20) /
++				     (static_cast<uint64_t>(std::max(cnt[c], 1u)) * maxval);
++	}
++
++	for (unsigned int c = 0; c < 3; c++) {
++		const uint32_t *acc = binAcc_[c].data();
++		const int32_t black = debayer_->binBlack_[c];
++		const int32_t gain = debayer_->binGain_[c];
++		int32_t *out = rgb[c];
++		for (unsigned int ox = 0; ox < outW; ox++) {
++			int32_t v = static_cast<int32_t>((acc[ox] * mul[(ox * k) & 1][c]) >> 20) - black;
++			if (v < 0)
++				v = 0;
++			v = static_cast<int32_t>((static_cast<int64_t>(v) * gain) >> 10);
++			/* clip at sensor full scale so blown highlights stay neutral */
++			out[ox] = std::min(v, 65535);
++		}
++	}
++}
++
++void DebayerCpuThread::processBinned(uint32_t frame, const uint8_t *src, uint8_t *dst)
++{
++	const int outW = debayer_->binOutSize_.width;
++	const int outH = debayer_->binOutSize_.height;
++	const unsigned int outputStride = debayer_->outputConfig_.stride;
++	const unsigned int bpp = debayer_->binOutBpp_;
++	const bool rgbOrder = debayer_->swapRedBlueGains_; /* BGR888 family: R first in memory */
++	const DebayerCpu::BinTuning tuning = debayer_->binTuning_;
++	const uint8_t *gammaLut = debayer_->binGamma_.data();
++	const int32_t (*m)[3] = debayer_->binMatrix_;
++
++	const unsigned int rawBytes = debayer_->window_.width * (debayer_->inputConfig_.bpp / 8) +
++				      2 * lineBufferPadding_;
++	for (auto &l : binLines_)
++		if (l.size() < rawBytes)
++			l.resize(rawBytes);
++	for (unsigned int c = 0; c < 3; c++) {
++		if (binAcc_[c].size() < static_cast<size_t>(outW))
++			binAcc_[c].resize(outW);
++		if (binAcc_r_.size() < static_cast<size_t>(outW)) {
++			binAcc_r_.resize(outW);
++			binAcc_g_.resize(outW);
++			binAcc_b_.resize(outW);
++		}
++		for (unsigned int slot = 0; slot < 3; slot++) {
++			if (binRows_[slot][c].size() < static_cast<size_t>(outW)) {
++				binRows_[slot][c].resize(outW);
++				binSum_[slot][c].resize(outW);
++				binYcc_[slot][c].resize(outW);
++			}
++		}
++	}
++
++	const int32_t dn = tuning.denoise * 205 / 100;	/* Q8, up to 0.8 */
++	const int32_t cdn = tuning.chroma * 256 / 100;	/* Q8, up to 1.0 */
++	const int32_t sh = tuning.sharpen * 384 / 100;	/* Q8, up to 1.5 */
++
++	int slotRow[3] = { -1, -1, -1 };
++	auto prepare = [&](int row) {
++		int slot = row % 3;
++		if (slotRow[slot] == row)
++			return;
++		slotRow[slot] = row;
++		int32_t *rgb[3] = { binRows_[slot][0].data(), binRows_[slot][1].data(), binRows_[slot][2].data() };
++		binAccumulate(frame, src, row,
++			      row >= static_cast<int>(yStart_) && row < static_cast<int>(yEnd_), rgb);
++		int32_t *Y = binYcc_[slot][0].data(), *Cr = binYcc_[slot][1].data(), *Cb = binYcc_[slot][2].data();
++		for (int x = 0; x < outW; x++) {
++			int32_t y = (rgb[0][x] + 2 * rgb[1][x] + rgb[2][x]) >> 2;
++			Y[x] = y;
++			Cr[x] = rgb[0][x] - y;
++			Cb[x] = rgb[2][x] - y;
++		}
++		for (unsigned int c = 0; c < 3; c++) {
++			const int32_t *v = binYcc_[slot][c].data();
++			int32_t *s = binSum_[slot][c].data();
++			s[0] = 2 * v[0] + v[std::min(1, outW - 1)];
++			for (int x = 1; x < outW - 1; x++)
++				s[x] = v[x - 1] + v[x] + v[x + 1];
++			if (outW > 1)
++				s[outW - 1] = v[outW - 2] + 2 * v[outW - 1];
++		}
++	};
++
++	dst += yStart_ * outputStride;
++	for (int oy = yStart_; oy < static_cast<int>(yEnd_); oy++, dst += outputStride) {
++		const int up = std::max(oy - 1, 0), dnRow = std::min(oy + 1, outH - 1);
++		prepare(up);
++		prepare(oy);
++		prepare(dnRow);
++
++		const int32_t *Y = binYcc_[oy % 3][0].data();
++		const int32_t *Cr = binYcc_[oy % 3][1].data();
++		const int32_t *Cb = binYcc_[oy % 3][2].data();
++		const int32_t *sY[3] = { binSum_[up % 3][0].data(), binSum_[oy % 3][0].data(), binSum_[dnRow % 3][0].data() };
++		const int32_t *sR[3] = { binSum_[up % 3][1].data(), binSum_[oy % 3][1].data(), binSum_[dnRow % 3][1].data() };
++		const int32_t *sB[3] = { binSum_[up % 3][2].data(), binSum_[oy % 3][2].data(), binSum_[dnRow % 3][2].data() };
++		uint8_t *o = dst;
++
++		const int rOff = rgbOrder ? 0 : 2, bOff = rgbOrder ? 2 : 0;
++		const int32_t m00 = m[0][0], m01 = m[0][1], m02 = m[0][2];
++		const int32_t m10 = m[1][0], m11 = m[1][1], m12 = m[1][2];
++		const int32_t m20 = m[2][0], m21 = m[2][1], m22 = m[2][2];
++		int32_t *ro = binAcc_r_.data(), *go = binAcc_g_.data(), *bo = binAcc_b_.data();
++
++		/* filter + colour matrix on whole rows: plain int32 so the compiler can vectorise */
++		for (int x = 0; x < outW; x++) {
++			/* 3x3 means: sum of nine * 455 >> 12 */
++			const int32_t yMean = ((sY[0][x] + sY[1][x] + sY[2][x]) * 455) >> 12;
++			const int32_t crMean = ((sR[0][x] + sR[1][x] + sR[2][x]) * 455) >> 12;
++			const int32_t cbMean = ((sB[0][x] + sB[1][x] + sB[2][x]) * 455) >> 12;
++
++			int32_t y = Y[x];
++			const int32_t d = y - yMean;
++			const int32_t ad = d < 0 ? -d : d;
++			/* noise threshold growing with the signal, capped */
++			const int32_t thr = std::min(40 + ((y + 4096) >> 5), 1200);
++			const int32_t under = std::min(ad, thr);
++			const int32_t over = ad - under;
++			const int32_t delta = ((sh * over) >> 8) - ((dn * under) >> 8);
++			y += d < 0 ? -delta : delta;
++
++			const int32_t cr = Cr[x] + ((cdn * (crMean - Cr[x])) >> 8);
++			const int32_t cb = Cb[x] + ((cdn * (cbMean - Cb[x])) >> 8);
++
++			const int32_t r = std::clamp(y + cr, 0, 65535);
++			const int32_t b = std::clamp(y + cb, 0, 65535);
++			const int32_t g = std::clamp(y - ((cr + cb) >> 1), 0, 65535);
++
++			ro[x] = std::clamp((m00 * r + m01 * g + m02 * b) >> 10, 0, 65535) >> 4;
++			go[x] = std::clamp((m10 * r + m11 * g + m12 * b) >> 10, 0, 65535) >> 4;
++			bo[x] = std::clamp((m20 * r + m21 * g + m22 * b) >> 10, 0, 65535) >> 4;
++		}
++
++		if (bpp == 4) {
++			for (int x = 0; x < outW; x++, o += 4) {
++				o[rOff] = gammaLut[ro[x]];
++				o[1] = gammaLut[go[x]];
++				o[bOff] = gammaLut[bo[x]];
++				o[3] = 255;
++			}
++		} else {
++			for (int x = 0; x < outW; x++, o += 3) {
++				o[rOff] = gammaLut[ro[x]];
++				o[1] = gammaLut[go[x]];
++				o[bOff] = gammaLut[bo[x]];
++			}
++		}
++	}
++}
++
+ void DebayerCpuThread::process4(uint32_t frame, const uint8_t *src, uint8_t *dst)
+ {
+ 	unsigned int outputStride = debayer_->outputConfig_.stride;
+@@ -997,6 +1420,14 @@ void DebayerCpu::updateGammaTable(const DebayerParams &params)
+ 
+ void DebayerCpu::updateLookupTables(const DebayerParams &params)
+ {
++	if (bin_ > 1) {
++		if (++binTuningCheck_ >= 15) {
++			binTuningCheck_ = 0;
++			loadBinTuning();
++		}
++		updateBinTables(params);
++	}
++
+ 	const bool gammaUpdateNeeded =
+ 		params.gamma != params_.gamma ||
+ 		params.blackLevel != params_.blackLevel ||
+diff --git a/src/libcamera/software_isp/debayer_cpu.h b/src/libcamera/software_isp/debayer_cpu.h
+index 5281c65..2c9f8af 100644
+--- a/src/libcamera/software_isp/debayer_cpu.h
++++ b/src/libcamera/software_isp/debayer_cpu.h
+@@ -13,6 +13,7 @@
+ 
+ #include <memory>
+ #include <stdint.h>
++#include <string>
+ #include <vector>
+ 
+ #include <libcamera/base/mutex.h>
+@@ -146,6 +147,39 @@ private:
+ 	CcmLookupTable blueCcm_;
+ 	std::array<double, kGammaLookupSize> gammaTable_;
+ 	LookupTable gammaLut_;
++
++	/*
++	 * N1X addition: binned high-precision path. When the requested output is at
++	 * most half the sensor size, each output pixel is the average of a bin x bin
++	 * block of raw pixels (per colour) instead of a centre crop, the maths stays
++	 * at 16 bits until the gamma table, and a small denoise/sharpen filter runs
++	 * on the binned image. Tunables come from ~/.config/n1x-camera.conf.
++	 */
++	struct BinTuning {
++		bool enable = true;	/* bin=0 restores the stock centre crop */
++		int denoise = 50;	/* 0..100 luma noise smoothing */
++		int chroma = 70;	/* 0..100 colour noise smoothing */
++		int sharpen = 40;	/* 0..100 edge sharpening */
++		float contrast = 1.15;	/* multiplies the S-curve exponent */
++		float saturation = 1.0;	/* extra saturation on top of the tuning file */
++	};
++	void loadBinTuning();
++	void updateBinTables(const DebayerParams &params);
++	static constexpr unsigned int kBinGammaSize = 4096;
++	BinTuning binTuning_;
++	std::string binTuningPath_;
++	int64_t binTuningMtime_ = -1;
++	unsigned int binTuningCheck_ = 0;
++	unsigned int bin_ = 1;		/* 1 = stock path */
++	unsigned int binBits_ = 10;
++	unsigned int binOutBpp_ = 3;
++	unsigned int binOrder_ = 0;	/* colour (0 R, 1 G, 2 B) at [y & 1][x & 1], packed 2 bits each */
++	Size binOutSize_;
++	std::array<uint8_t, kBinGammaSize> binGamma_;
++	int32_t binMatrix_[3][3];	/* Q12, rows R G B */
++	int32_t binBlack_[3];		/* 16-bit scale */
++	int32_t binGain_[3];		/* Q10 */
++
+ 	bool ccmEnabled_;
+ 	DebayerParams params_;
+ 
