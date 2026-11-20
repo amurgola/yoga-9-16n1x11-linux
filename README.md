@@ -12,9 +12,16 @@ its limits. Most of it builds on other people's work; see [Credits](#credits).
 620.70.06, KDE Plasma 6.8 on Wayland. Nothing here has been tried on another unit, another firmware
 version or another distribution.
 
-**Unofficial.** Not affiliated with Lenovo, NVIDIA, MediaTek or Microsoft. Several pieces write to
-hardware registers or change authentication. Read the code before running it; you can hang or reset
-the machine, and you are responsible for what you run.
+## Use at your own risk
+
+Everything here is provided as is, with no warranty of any kind and no support. It is unofficial and
+not affiliated with Lenovo, NVIDIA, MediaTek or Microsoft.
+
+Several pieces write to hardware registers, load kernel modules, change power limits or change how
+you log in. They can hang or reset the machine, lose unsaved work, drain the battery, or lock you
+out of an account if applied carelessly. Nothing here has been tested beyond one laptop. Read the
+code before running it, keep a way to recover (a second boot entry, your password, a backup), and
+accept that whatever happens to your device and data is your responsibility.
 
 ## What works
 
