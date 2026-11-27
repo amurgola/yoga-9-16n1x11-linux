@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * n1x_wake_timer - wake the Lenovo Yoga 83N7 (NVIDIA N1X) from s2idle on a timer.
+ * n1x_wake_timer - wake an NVIDIA N1X laptop from s2idle on a timer.
  *
- * The machine has no working wake alarm: rtc-efi cannot wake it and the ACPI
- * Time-and-Alarm device (ACPI000E) is a stub in the EC.  The SoC does have
+ * Binds on the Lenovo Yoga 83N7 and the ASUS ProArt P16 H7607BA, whose GTDTs
+ * describe the same timer block.
+ *
+ * These machines have no working wake alarm: rtc-efi cannot wake them (on the
+ * Yoga the ACPI Time-and-Alarm device (ACPI000E) is a stub in the EC).  The SoC does have
  * eight always-on memory-mapped generic-timer frames (GTDT, block 0x1C430000);
  * Linux uses frame 0 as its broadcast timer.  This module takes a spare frame
  * and uses its physical timer as a wake source.
@@ -156,7 +159,8 @@ static int __init wt_init(void)
 	u64 a, b;
 	int ret;
 
-	if (!dmi_match(DMI_PRODUCT_NAME, "83N7"))
+	if (!dmi_match(DMI_PRODUCT_NAME, "83N7") &&
+	    !dmi_match(DMI_PRODUCT_NAME, "ProArt P16 H7607BA"))
 		return -ENODEV;
 	if (frame < 1 || frame > 7)
 		return -EINVAL;
@@ -226,4 +230,4 @@ static void __exit wt_exit(void)
 module_init(wt_init);
 module_exit(wt_exit);
 MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("Timer wake from s2idle for the Lenovo Yoga 83N7 (NVIDIA N1X)");
+MODULE_DESCRIPTION("Timer wake from s2idle for NVIDIA N1X laptops (Lenovo Yoga 83N7, ASUS ProArt P16 H7607BA)");
