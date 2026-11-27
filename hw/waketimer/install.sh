@@ -1,5 +1,5 @@
 #!/bin/bash
-# Timer wake from sleep for the Lenovo 83N7.  sudo ./install.sh [period-seconds, default 7200]
+# Timer wake from sleep for the Lenovo 83N7 and the ASUS ProArt P16 H7607BA.  sudo ./install.sh [period-seconds, default 7200]
 # The module is rebuilt by DKMS at kernel updates.  period 0 = load the module but never wake by itself.
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
